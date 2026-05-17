@@ -301,13 +301,14 @@ class PasteHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    global DB_PATH, HOST, PORT
+    
     parser = argparse.ArgumentParser(description="Forge Paste Server")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port (default: {PORT})")
     parser.add_argument("--host", default=HOST, help=f"Host (default: {HOST})")
     parser.add_argument("--db", default=DB_PATH, help=f"Database path (default: {DB_PATH})")
     args = parser.parse_args()
     
-    global DB_PATH, HOST, PORT
     DB_PATH = args.db
     HOST = args.host
     PORT = args.port
