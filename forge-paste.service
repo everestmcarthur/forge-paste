@@ -1,0 +1,15 @@
+[Unit]
+Description=Forge Paste Server
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+ExecStart=/usr/bin/python3 /opt/forge-paste/forge-paste.py --port 7890 --host 127.0.0.1
+Restart=always
+RestartSec=5
+Environment=FORGE_PASTE_DB=/var/lib/forge-paste/pastes.db
+
+[Install]
+WantedBy=multi-user.target
