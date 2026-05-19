@@ -4,7 +4,7 @@ Forge Paste — A lightweight, self-hosted paste server.
 Hastebin-compatible API with a clean web UI.
 
 Usage:
-    python3 forge-paste.py [--port PORT] [--host HOST] [--db PATH]
+    python3 forge-paste.py [--port PORT] [--host HOST] [--db PATH] [--max-age DAYS]
 
 API:
     POST /api/paste         — raw text body → {"key": "abc123", "url": "..."}
@@ -31,6 +31,9 @@ DB_PATH = os.environ.get("FORGE_PASTE_DB", "/var/lib/forge-paste/pastes.db")
 HOST = os.environ.get("FORGE_PASTE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("FORGE_PASTE_PORT", "7890"))
 MAX_SIZE = 512 * 1024  # 512KB
+MAX_AGE_DAYS = int(os.environ.get("FORGE_PASTE_MAX_AGE", "30"))  # Default 30 days
+_CLEANUP_INTERVAL = 3600  # Run cleanup at most once per hour
+_last_cleanup = 0
 
 def get_db():
     """Get a thread-local database connection."""
@@ -52,27 +55,60 @@ def init_db():
             language TEXT,
             created_at REAL NOT NULL DEFAULT (unixepoch()),
             views INTEGER NOT NULL DEFAULT 0,
-            ip TEXT
+            ip TEXT,
+            expires_at REAL
         )
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_slug ON pastes(slug)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_created ON pastes(created_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_expires ON pastes(expires_at)")
     db.commit()
+
+    # Migrate: add expires_at column if missing (existing installs)
+    cols = [row[1] for row in db.execute("PRAGMA table_info(pastes)").fetchall()]
+    if "expires_at" not in cols:
+        db.execute("ALTER TABLE pastes ADD COLUMN expires_at REAL")
+        # Backfill existing pastes: expire them MAX_AGE_DAYS from creation
+        db.execute(
+            "UPDATE pastes SET expires_at = created_at + ? WHERE expires_at IS NULL",
+            (MAX_AGE_DAYS * 86400,),
+        )
+        db.commit()
+
     db.close()
 
 def generate_slug(length=8):
     chars = string.ascii_lowercase + string.digits
     return ''.join(random.choices(chars, k=length))
 
+def cleanup_expired():
+    """Delete expired pastes. Runs at most once per _CLEANUP_INTERVAL."""
+    global _last_cleanup
+    now = time.time()
+    if now - _last_cleanup < _CLEANUP_INTERVAL:
+        return
+    _last_cleanup = now
+    db = get_db()
+    deleted = db.execute(
+        "DELETE FROM pastes WHERE expires_at IS NOT NULL AND expires_at < ?", (now,)
+    ).rowcount
+    if deleted:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    db.commit()
+    db.close()
+
 def create_paste(content, language=None, ip=None):
+    cleanup_expired()  # Opportunistic cleanup
     db = get_db()
     slug = generate_slug()
     # Ensure unique
     while db.execute("SELECT 1 FROM pastes WHERE slug=?", (slug,)).fetchone():
         slug = generate_slug()
+    now = time.time()
+    expires_at = now + (MAX_AGE_DAYS * 86400) if MAX_AGE_DAYS > 0 else None
     db.execute(
-        "INSERT INTO pastes (slug, content, language, created_at, views, ip) VALUES (?, ?, ?, ?, 0, ?)",
-        (slug, content, language, time.time(), ip)
+        "INSERT INTO pastes (slug, content, language, created_at, views, ip, expires_at) VALUES (?, ?, ?, ?, 0, ?, ?)",
+        (slug, content, language, now, ip, expires_at)
     )
     db.commit()
     db.close()
@@ -80,7 +116,11 @@ def create_paste(content, language=None, ip=None):
 
 def get_paste(slug):
     db = get_db()
-    row = db.execute("SELECT * FROM pastes WHERE slug=?", (slug,)).fetchone()
+    # Exclude expired pastes from reads
+    row = db.execute(
+        "SELECT * FROM pastes WHERE slug=? AND (expires_at IS NULL OR expires_at > ?)",
+        (slug, time.time()),
+    ).fetchone()
     if row:
         db.execute("UPDATE pastes SET views = views + 1 WHERE slug=?", (slug,))
         db.commit()
@@ -183,6 +223,19 @@ def page_viewer(paste, host, is_new=False):
     v = paste["views"]
     slug = paste["slug"]
     url = f"{host}/{slug}"
+    expires_at = paste.get("expires_at")
+    if expires_at:
+        expires_in = expires_at - time.time()
+        if expires_in > 86400:
+            expiry_text = f"expires in {int(expires_in // 86400)}d"
+        elif expires_in > 3600:
+            expiry_text = f"expires in {int(expires_in // 3600)}h"
+        elif expires_in > 0:
+            expiry_text = "expires soon"
+        else:
+            expiry_text = "expired"
+    else:
+        expiry_text = "no expiry"
     
     if is_new:
         return f"""<!DOCTYPE html>
@@ -200,7 +253,7 @@ def page_viewer(paste, host, is_new=False):
 <title>{slug} — Forge Paste</title>{STYLE}</head><body>
 <div class="header"><div class="left"><a href="/" style="display:flex;align-items:center;gap:12px">{ICON_SVG}<h1>Forge Paste</h1></a>
 <span class="slug">/{slug}</span></div>
-<div class="right"><span class="meta">{ta} · {v} view{'s' if v != 1 else ''}</span>
+<div class="right"><span class="meta">{ta} · {v} view{'s' if v != 1 else ''} · {expiry_text}</span>
 <button class="btn btn-secondary" onclick="navigator.clipboard.writeText(document.getElementById('raw').textContent);this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)">Copy</button>
 <a href="/api/raw/{slug}" class="btn btn-secondary">Raw</a>
 <a href="/" class="btn btn-primary">New</a></div></div>
@@ -276,7 +329,12 @@ class PasteHandler(BaseHTTPRequestHandler):
         self._send(404, page_notfound())
     
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            return self._send(400, json.dumps({"error": "Invalid Content-Length"}), "application/json")
+        if length < 0:
+            return self._send(400, json.dumps({"error": "Invalid Content-Length"}), "application/json")
         if length > MAX_SIZE:
             return self._send(413, json.dumps({"error": "Content too large (max 512KB)"}), "application/json")
         
@@ -301,17 +359,19 @@ class PasteHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global DB_PATH, HOST, PORT
+    global DB_PATH, HOST, PORT, MAX_AGE_DAYS
     
     parser = argparse.ArgumentParser(description="Forge Paste Server")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port (default: {PORT})")
     parser.add_argument("--host", default=HOST, help=f"Host (default: {HOST})")
     parser.add_argument("--db", default=DB_PATH, help=f"Database path (default: {DB_PATH})")
+    parser.add_argument("--max-age", type=int, default=MAX_AGE_DAYS, help=f"Paste TTL in days, 0 = never expire (default: {MAX_AGE_DAYS})")
     args = parser.parse_args()
     
     DB_PATH = args.db
     HOST = args.host
     PORT = args.port
+    MAX_AGE_DAYS = args.max_age
     
     init_db()
     
