@@ -59,11 +59,6 @@ def init_db():
             expires_at REAL
         )
     """)
-    db.execute("CREATE INDEX IF NOT EXISTS idx_slug ON pastes(slug)")
-    db.execute("CREATE INDEX IF NOT EXISTS idx_created ON pastes(created_at)")
-    db.execute("CREATE INDEX IF NOT EXISTS idx_expires ON pastes(expires_at)")
-    db.commit()
-
     # Migrate: add expires_at column if missing (existing installs)
     cols = [row[1] for row in db.execute("PRAGMA table_info(pastes)").fetchall()]
     if "expires_at" not in cols:
@@ -74,6 +69,11 @@ def init_db():
             (MAX_AGE_DAYS * 86400,),
         )
         db.commit()
+
+    db.execute("CREATE INDEX IF NOT EXISTS idx_slug ON pastes(slug)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_created ON pastes(created_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_expires ON pastes(expires_at)")
+    db.commit()
 
     db.close()
 
